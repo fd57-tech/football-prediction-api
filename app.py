@@ -1,15 +1,11 @@
-"""
-API de prédiction football avec modèle Bayesian hiérarchique
-Déployable sur Render.com
-"""
-
 import os
 import json
 import requests
 import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+import mysql.connector
+from mysql.connector import pooling
 
 # FastAPI et dépendances
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -17,25 +13,45 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# Machine Learning
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
-import pickle
+# Machine Learning (sans pandas ni sklearn pour économiser la mémoire)
 from scipy.stats import poisson
+import pickle
+
+# Configuration MySQL depuis Hostinger
+MYSQL_CONFIG = {
+    'host': 'srv1043.hstgr.io',
+    'database': 'u827503784_appdevfoot',
+    'user': 'u827503784_BnFnX7',
+    'password': 'TestApFootProno7+',
+    'port': 3306,
+    'raise_on_warnings': False,
+    'use_pure': True,  # Important pour la compatibilité
+    'autocommit': True,
+    'pool_size': 3,  # Limiter les connexions pour économiser la mémoire
+    'pool_name': 'mypool'
+}
 
 # Configuration depuis les variables d'environnement
 PHP_BRIDGE_URL = os.getenv('PHP_BRIDGE_URL', 'https://appdevfoot.leselixirsdedamenature.fr/api_bridge_enhanced.php')
 PHP_SECRET = os.getenv('PHP_SECRET', 'TonSecret2024')
 PORT = int(os.getenv('PORT', 8000))
 
+# Pool de connexions MySQL (plus efficace)
+try:
+    connection_pool = mysql.connector.pooling.MySQLConnectionPool(**MYSQL_CONFIG)
+    print("✅ Pool de connexions MySQL créé avec succès")
+except Exception as e:
+    print(f"❌ Erreur création pool MySQL: {e}")
+    connection_pool = None
+
 # Créer l'application FastAPI
 app = FastAPI(
     title="Football Prediction API",
-    description="API de prédiction avec modèle Bayesian et ML ensemble",
-    version="2.0"
+    description="API de prédiction avec modèle Bayesian optimisé pour Render",
+    version="2.1"
 )
 
-# Configuration CORS pour permettre les requêtes depuis PHP
+# Configuration CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,108 +87,155 @@ class PredictionRequest(BaseModel):
     features: Optional[MatchFeatures] = None
     odds_consensus: Optional[Dict] = None
 
-class OddsConsensus(BaseModel):
-    """Consensus des bookmakers"""
-    home_odd: float
-    draw_odd: float
-    away_odd: float
-    bookmakers: List[str] = []
+# ==================== FONCTIONS UTILITAIRES MYSQL ====================
 
-# ==================== MODÈLE BAYESIAN ====================
+def get_db_connection():
+    """Obtenir une connexion depuis le pool"""
+    if connection_pool:
+        try:
+            return connection_pool.get_connection()
+        except Exception as e:
+            print(f"Erreur obtention connexion: {e}")
+            # Tenter une connexion directe en fallback
+            return mysql.connector.connect(**{k: v for k, v in MYSQL_CONFIG.items() 
+                                           if k not in ['pool_size', 'pool_name']})
+    else:
+        # Si pas de pool, connexion directe
+        return mysql.connector.connect(**{k: v for k, v in MYSQL_CONFIG.items() 
+                                       if k not in ['pool_size', 'pool_name']})
 
-class BayesianPoissonModel:
+def execute_query(query: str, params: tuple = None, fetch_all: bool = True):
+    """Exécuter une requête MySQL de manière optimisée"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, params)
+        
+        if fetch_all:
+            result = cursor.fetchall()
+        else:
+            result = cursor.fetchone()
+        
+        return result
+        
+    except Exception as e:
+        print(f"Erreur requête MySQL: {e}")
+        return None
+        
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# ==================== MODÈLE BAYESIAN OPTIMISÉ ====================
+
+class BayesianPoissonModelLite:
     """
-    Modèle Bayesian Hiérarchique pour prédiction football
-    Utilise une distribution de Poisson avec priors Gamma
+    Version allégée du modèle Bayesian pour économiser la mémoire
+    Utilise uniquement numpy et scipy (pas de pandas)
     """
     
     def __init__(self, alpha_prior=1.5, beta_prior=1.5):
         self.alpha_prior = alpha_prior
         self.beta_prior = beta_prior
         self.team_strengths = {}
-        self.league_effects = {}  # Effet hiérarchique par ligue
+        self.league_effects = {}
         
-    def fit(self, training_data):
+    def fit_from_db(self):
         """
-        Entraîne le modèle sur les données historiques
-        Implémente la hiérarchie : Ligue -> Équipe -> Match
+        Entraîne le modèle directement depuis la base MySQL
+        Plus efficace en mémoire que de charger toutes les données
         """
-        if isinstance(training_data, list):
-            df = pd.DataFrame(training_data)
-        else:
-            df = training_data
-            
-        # Calculer les effets par ligue (niveau hiérarchique supérieur)
-        for league in df['competition_name'].unique():
-            league_matches = df[df['competition_name'] == league]
-            avg_goals = (league_matches['home_score'].mean() + 
-                        league_matches['away_score'].mean()) / 2
-            self.league_effects[league] = avg_goals / 1.5  # Normaliser autour de 1.5
+        print("📊 Entraînement du modèle depuis MySQL...")
         
-        # Calculer les forces d'équipes avec effet de ligue
-        all_teams = pd.concat([df['home_team'], df['away_team']]).unique()
+        # Récupérer les statistiques agrégées par équipe (plus efficace)
+        query_teams = """
+        SELECT 
+            team_name,
+            COUNT(*) as matches_played,
+            AVG(goals_scored) as avg_goals_scored,
+            AVG(goals_conceded) as avg_goals_conceded,
+            AVG(CASE WHEN is_home = 1 THEN goals_scored ELSE goals_conceded END) as home_performance,
+            AVG(CASE WHEN is_home = 0 THEN goals_scored ELSE goals_conceded END) as away_performance
+        FROM (
+            SELECT 
+                home_team as team_name,
+                home_score as goals_scored,
+                away_score as goals_conceded,
+                1 as is_home
+            FROM matches
+            WHERE home_score IS NOT NULL
+            UNION ALL
+            SELECT 
+                away_team as team_name,
+                away_score as goals_scored,
+                home_score as goals_conceded,
+                0 as is_home
+            FROM matches
+            WHERE away_score IS NOT NULL
+        ) as team_stats
+        GROUP BY team_name
+        HAVING matches_played >= 5
+        """
         
-        for team in all_teams:
-            home_matches = df[df['home_team'] == team]
-            away_matches = df[df['away_team'] == team]
-            
-            # Buts marqués et encaissés
-            goals_home = home_matches['home_score'].sum() if len(home_matches) > 0 else 0
-            goals_away = away_matches['away_score'].sum() if len(away_matches) > 0 else 0
-            conceded_home = home_matches['away_score'].sum() if len(home_matches) > 0 else 0
-            conceded_away = away_matches['home_score'].sum() if len(away_matches) > 0 else 0
-            
-            n_matches = len(home_matches) + len(away_matches)
-            
-            if n_matches > 0:
-                # Mise à jour Bayésienne avec prior informatif
-                alpha_attack = self.alpha_prior + goals_home + goals_away
+        teams_data = execute_query(query_teams)
+        
+        if teams_data:
+            for team in teams_data:
+                n_matches = team['matches_played']
+                
+                # Mise à jour Bayésienne
+                alpha_attack = self.alpha_prior + team['avg_goals_scored'] * n_matches
                 beta_attack = self.beta_prior + n_matches
                 
-                alpha_defense = self.alpha_prior + conceded_home + conceded_away
+                alpha_defense = self.alpha_prior + team['avg_goals_conceded'] * n_matches
                 beta_defense = self.beta_prior + n_matches
                 
-                # Calculer la force avec shrinkage vers la moyenne de la ligue
-                attack_strength = alpha_attack / beta_attack
-                defense_strength = alpha_defense / beta_defense
+                # Facteur de confiance
+                confidence = min(1.0, n_matches / 20)
                 
-                # Facteur de confiance basé sur le nombre de matchs
-                confidence = min(1.0, n_matches / 20)  # Confiance max après 20 matchs
+                # Force avec shrinkage
+                attack_strength = (alpha_attack / beta_attack) * confidence + 1.5 * (1 - confidence)
+                defense_strength = (alpha_defense / beta_defense) * confidence + 1.5 * (1 - confidence)
                 
-                # Moyenne de ligue pour le shrinkage
-                team_leagues = pd.concat([
-                    home_matches['competition_name'],
-                    away_matches['competition_name']
-                ]).value_counts()
-                
-                if len(team_leagues) > 0:
-                    main_league = team_leagues.index[0]
-                    league_factor = self.league_effects.get(main_league, 1.0)
-                else:
-                    league_factor = 1.0
-                
-                # Appliquer le shrinkage vers la moyenne de la ligue
-                attack_strength = confidence * attack_strength + (1 - confidence) * 1.5 * league_factor
-                defense_strength = confidence * defense_strength + (1 - confidence) * 1.5 * league_factor
-                
-            else:
-                # Pas de données : utiliser les priors
-                attack_strength = 1.5
-                defense_strength = 1.5
-                confidence = 0.0
+                self.team_strengths[team['team_name']] = {
+                    'attack': attack_strength,
+                    'defense': defense_strength,
+                    'matches': n_matches,
+                    'confidence': confidence
+                }
             
-            self.team_strengths[team] = {
-                'attack': attack_strength,
-                'defense': defense_strength,
-                'matches_played': n_matches,
-                'confidence': confidence
-            }
+            print(f"✅ Modèle entraîné sur {len(self.team_strengths)} équipes")
+        else:
+            print("⚠️ Aucune donnée d'entraînement disponible")
+        
+        # Récupérer les effets de ligue
+        query_leagues = """
+        SELECT 
+            competition_name,
+            AVG(home_score + away_score) as avg_total_goals,
+            COUNT(*) as matches_count
+        FROM matches
+        WHERE competition_name IS NOT NULL
+        GROUP BY competition_name
+        HAVING matches_count >= 20
+        """
+        
+        leagues_data = execute_query(query_leagues)
+        
+        if leagues_data:
+            for league in leagues_data:
+                # Normaliser autour de 2.5 buts (moyenne standard)
+                self.league_effects[league['competition_name']] = league['avg_total_goals'] / 2.5
     
-    def predict_match(self, home_team, away_team, competition=None, odds_consensus=None):
+    def predict_match(self, home_team: str, away_team: str, competition: str = None):
         """
-        Prédit un match avec consensus des bookmakers optionnel
+        Prédit un match avec le modèle Bayesian
         """
-        # Récupérer les forces des équipes
+        # Récupérer les forces des équipes ou utiliser les valeurs par défaut
         home_stats = self.team_strengths.get(home_team, {
             'attack': 1.5, 'defense': 1.5, 'confidence': 0
         })
@@ -180,301 +243,165 @@ class BayesianPoissonModel:
             'attack': 1.3, 'defense': 1.3, 'confidence': 0
         })
         
-        # Effet de ligue si disponible
+        # Effet de ligue
         league_factor = self.league_effects.get(competition, 1.0) if competition else 1.0
         
-        # Lambda pour la distribution de Poisson
-        home_lambda = home_stats['attack'] * away_stats['defense'] * 1.148 * league_factor  # Avantage domicile
+        # Lambda pour Poisson (avec avantage domicile)
+        home_lambda = home_stats['attack'] * away_stats['defense'] * 1.148 * league_factor
         away_lambda = away_stats['attack'] * home_stats['defense'] * 0.87 * league_factor
         
-        # Matrice de probabilités pour tous les scores possibles
-        max_goals = 8
-        prob_matrix = np.zeros((max_goals, max_goals))
+        # Limiter les lambdas pour éviter les débordements
+        home_lambda = min(home_lambda, 5.0)
+        away_lambda = min(away_lambda, 5.0)
+        
+        # Calculer les probabilités de manière efficace
+        max_goals = 6  # Réduire pour économiser la mémoire
+        
+        home_win_prob = 0
+        draw_prob = 0
+        away_win_prob = 0
         
         for i in range(max_goals):
             for j in range(max_goals):
-                prob_matrix[i, j] = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
+                prob = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
+                if i > j:
+                    home_win_prob += prob
+                elif i == j:
+                    draw_prob += prob
+                else:
+                    away_win_prob += prob
         
-        # Calculer les probabilités de résultat
-        home_win = np.sum(np.tril(prob_matrix, -1))
-        draw = np.sum(np.diag(prob_matrix))
-        away_win = np.sum(np.triu(prob_matrix, 1))
+        # Calculer les statistiques supplémentaires
+        over_25 = 1 - sum([poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda) 
+                          for i in range(3) for j in range(3) if i + j <= 2])
         
-        # Intégrer le consensus des bookmakers si disponible
-        if odds_consensus:
-            # Convertir les cotes en probabilités
-            if 'odds' in odds_consensus:
-                home_odd = odds_consensus['odds'].get('home', 0)
-                draw_odd = odds_consensus['odds'].get('draw', 0)
-                away_odd = odds_consensus['odds'].get('away', 0)
-                
-                if home_odd > 0 and draw_odd > 0 and away_odd > 0:
-                    # Probabilités implicites des bookmakers
-                    total_inv = 1/home_odd + 1/draw_odd + 1/away_odd
-                    market_home = (1/home_odd) / total_inv
-                    market_draw = (1/draw_odd) / total_inv
-                    market_away = (1/away_odd) / total_inv
-                    
-                    # Pondération : plus de confiance au marché pour les grandes ligues
-                    market_weight = 0.4 if competition and 'priority' in self.league_effects else 0.3
-                    
-                    home_win = (1 - market_weight) * home_win + market_weight * market_home
-                    draw = (1 - market_weight) * draw + market_weight * market_draw
-                    away_win = (1 - market_weight) * away_win + market_weight * market_away
+        btts = 1 - (poisson.pmf(0, home_lambda) + poisson.pmf(0, away_lambda) - 
+                   poisson.pmf(0, home_lambda) * poisson.pmf(0, away_lambda))
         
-        # Normaliser pour que la somme = 1
-        total = home_win + draw + away_win
-        if total > 0:
-            home_win /= total
-            draw /= total
-            away_win /= total
+        # Score le plus probable
+        most_likely_home = int(home_lambda)
+        most_likely_away = int(away_lambda)
         
-        # Calculer les scores les plus probables
-        most_likely_score = np.unravel_index(prob_matrix.argmax(), prob_matrix.shape)
-        
-        # Calculer la confiance (combinaison de plusieurs facteurs)
-        confidence = min(home_stats['confidence'], away_stats['confidence'])
-        confidence = confidence * 0.7 + max([home_win, draw, away_win]) * 0.3
+        # Calculer la confiance
+        confidence = max([home_win_prob, draw_prob, away_win_prob])
+        if home_team in self.team_strengths and away_team in self.team_strengths:
+            confidence = confidence * 0.6 + min(home_stats['confidence'], away_stats['confidence']) * 0.4
         
         return {
             'probabilities': {
-                'home': round(home_win, 3),
-                'draw': round(draw, 3),
-                'away': round(away_win, 3)
+                'home': round(home_win_prob, 3),
+                'draw': round(draw_prob, 3),
+                'away': round(away_win_prob, 3)
             },
             'expected_goals': {
                 'home': round(home_lambda, 2),
                 'away': round(away_lambda, 2),
                 'total': round(home_lambda + away_lambda, 2),
-                'over_2.5': round(1 - sum([prob_matrix[i, j] for i in range(3) for j in range(3) if i + j <= 2]), 3),
-                'btts': round(1 - (sum(prob_matrix[0, :]) + sum(prob_matrix[:, 0]) - prob_matrix[0, 0]), 3)
+                'over_2.5': round(over_25, 3),
+                'btts': round(btts, 3)
             },
-            'most_likely_score': f"{most_likely_score[0]}-{most_likely_score[1]}",
+            'most_likely_score': f"{most_likely_home}-{most_likely_away}",
             'confidence': round(confidence, 3),
-            'model': 'bayesian_hierarchical'
+            'model': 'bayesian_lite'
         }
 
-# ==================== CLASSE PRINCIPALE DE PRÉDICTION ====================
+# ==================== INSTANCE GLOBALE ====================
 
-class FootballPredictor:
-    """
-    Classe principale qui combine tous les modèles
-    """
-    
-    def __init__(self):
-        self.bayesian_model = BayesianPoissonModel()
-        self.rf_model = None
-        self.xgb_model = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.training_date = None
-        
-    def fetch_training_data(self):
-        """
-        Récupère les données d'entraînement depuis PHP
-        """
-        try:
-            response = requests.post(
-                PHP_BRIDGE_URL,
-                data={
-                    'secret': PHP_SECRET,
-                    'action': 'get_training_data',
-                    'limit': 2000
-                }
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('matches', [])
-            else:
-                print(f"Erreur lors de la récupération des données : {response.status_code}")
-                return []
-                
-        except Exception as e:
-            print(f"Erreur de connexion au bridge PHP : {e}")
-            return []
-    
-    def train(self):
-        """
-        Entraîne tous les modèles
-        """
-        print("🔄 Récupération des données d'entraînement...")
-        training_data = self.fetch_training_data()
-        
-        if len(training_data) < 100:
-            print(f"⚠️ Seulement {len(training_data)} matchs disponibles. Entraînement minimal.")
-            
-        if training_data:
-            # Entraîner le modèle Bayesian
-            print(f"📊 Entraînement du modèle Bayesian sur {len(training_data)} matchs...")
-            self.bayesian_model.fit(training_data)
-            
-            # TODO: Ajouter l'entraînement des modèles ML (Random Forest, XGBoost)
-            # Pour l'instant, on se concentre sur le Bayesian qui est le plus important
-            
-            self.is_trained = True
-            self.training_date = datetime.now()
-            print("✅ Entraînement terminé avec succès")
-            
-            # Sauvegarder le modèle
-            self.save_model()
-        else:
-            print("❌ Aucune donnée d'entraînement disponible")
-    
-    def save_model(self):
-        """
-        Sauvegarde le modèle entraîné
-        """
-        try:
-            model_data = {
-                'bayesian_team_strengths': self.bayesian_model.team_strengths,
-                'bayesian_league_effects': self.bayesian_model.league_effects,
-                'training_date': self.training_date.isoformat() if self.training_date else None,
-                'is_trained': self.is_trained
-            }
-            
-            with open('model_cache.json', 'w') as f:
-                json.dump(model_data, f)
-                
-            print("💾 Modèle sauvegardé dans model_cache.json")
-            
-        except Exception as e:
-            print(f"❌ Erreur lors de la sauvegarde : {e}")
-    
-    def load_model(self):
-        """
-        Charge un modèle sauvegardé
-        """
-        try:
-            if os.path.exists('model_cache.json'):
-                with open('model_cache.json', 'r') as f:
-                    model_data = json.load(f)
-                
-                self.bayesian_model.team_strengths = model_data['bayesian_team_strengths']
-                self.bayesian_model.league_effects = model_data['bayesian_league_effects']
-                self.is_trained = model_data['is_trained']
-                
-                if model_data['training_date']:
-                    self.training_date = datetime.fromisoformat(model_data['training_date'])
-                
-                print(f"✅ Modèle chargé (entraîné le {self.training_date})")
-                return True
-                
-        except Exception as e:
-            print(f"⚠️ Impossible de charger le modèle : {e}")
-            
-        return False
-    
-    def predict(self, home_team: str, away_team: str, competition: str = None, 
-               features: MatchFeatures = None, odds_consensus: Dict = None):
-        """
-        Effectue une prédiction complète
-        """
-        if not self.is_trained:
-            # Essayer de charger un modèle sauvegardé
-            if not self.load_model():
-                # Si pas de modèle, entraîner
-                self.train()
-        
-        # Prédiction Bayesienne (toujours disponible)
-        bayesian_pred = self.bayesian_model.predict_match(
-            home_team, away_team, competition, odds_consensus
-        )
-        
-        # TODO: Ajouter les prédictions ML quand elles seront implémentées
-        
-        # Pour l'instant, retourner uniquement la prédiction Bayesienne
-        prediction = bayesian_pred
-        
-        # Déterminer le résultat le plus probable
-        probs = prediction['probabilities']
-        if probs['home'] > probs['draw'] and probs['home'] > probs['away']:
-            prediction['predicted_outcome'] = 'HOME'
-        elif probs['draw'] > probs['away']:
-            prediction['predicted_outcome'] = 'DRAW'
-        else:
-            prediction['predicted_outcome'] = 'AWAY'
-        
-        return prediction
-
-# ==================== INSTANCE GLOBALE DU PRÉDICTEUR ====================
-
-predictor = FootballPredictor()
+predictor = BayesianPoissonModelLite()
 
 # ==================== ENDPOINTS DE L'API ====================
 
 @app.on_event("startup")
 async def startup_event():
     """
-    Appelé au démarrage de l'API
+    Initialisation au démarrage
     """
-    print("🚀 Démarrage de l'API de prédiction football...")
-    print(f"📡 Bridge PHP configuré : {PHP_BRIDGE_URL}")
+    print("🚀 Démarrage de l'API Football Prediction...")
+    print(f"📡 Configuration MySQL: {MYSQL_CONFIG['host']}/{MYSQL_CONFIG['database']}")
     
-    # Charger ou entraîner le modèle
-    if not predictor.load_model():
-        print("🔄 Aucun modèle en cache, entraînement initial...")
-        predictor.train()
+    # Tester la connexion MySQL
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM matches")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        print(f"✅ Connexion MySQL OK - {count} matchs en base")
+        
+        # Entraîner le modèle si des données sont disponibles
+        if count > 100:
+            predictor.fit_from_db()
+        else:
+            print("⚠️ Pas assez de données pour l'entraînement")
+            
+    except Exception as e:
+        print(f"❌ Erreur connexion MySQL: {e}")
     
-    print("✅ API prête à recevoir des requêtes")
+    print("✅ API prête!")
 
 @app.get("/")
 def root():
     """
-    Endpoint de test et d'information
+    Point d'entrée principal
     """
     return {
         "status": "online",
         "service": "Football Prediction API",
-        "version": "2.0",
+        "version": "2.1",
         "model": {
-            "trained": predictor.is_trained,
-            "training_date": predictor.training_date.isoformat() if predictor.training_date else None,
-            "teams_in_model": len(predictor.bayesian_model.team_strengths),
-            "leagues_in_model": len(predictor.bayesian_model.league_effects)
-        },
-        "endpoints": {
-            "predictions": "/predict",
-            "batch_predictions": "/predict/batch",
-            "model_info": "/model/info",
-            "retrain": "/model/retrain"
+            "type": "bayesian_lite",
+            "teams_count": len(predictor.team_strengths),
+            "leagues_count": len(predictor.league_effects)
         }
     }
+
+@app.get("/health")
+def health_check():
+    """
+    Health check pour Render
+    """
+    # Vérifier la connexion MySQL
+    db_status = "unknown"
+    try:
+        conn = get_db_connection()
+        conn.close()
+        db_status = "connected"
+    except:
+        db_status = "disconnected"
+    
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "memory_usage_mb": get_memory_usage()
+    }
+
+def get_memory_usage():
+    """
+    Obtenir l'utilisation mémoire actuelle
+    """
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return round(usage.ru_maxrss / 1024, 2)  # En MB
+    except:
+        return 0
 
 @app.post("/predict")
 async def predict_match(request: PredictionRequest):
     """
-    Endpoint principal de prédiction pour un match
+    Prédire un match
     """
     try:
-        # Si pas de features, les récupérer depuis PHP
-        if not request.features:
-            response = requests.post(
-                PHP_BRIDGE_URL,
-                data={
-                    'secret': PHP_SECRET,
-                    'action': 'get_match_features',
-                    'match_id': request.match_id
-                }
-            )
-            
-            if response.status_code == 200:
-                features_data = response.json()
-                # Convertir en MatchFeatures
-                # TODO: Mapper les données correctement
-            else:
-                # Utiliser les valeurs par défaut
-                features = MatchFeatures()
-        else:
-            features = request.features
+        # Si le modèle n'est pas entraîné, le faire maintenant
+        if not predictor.team_strengths:
+            predictor.fit_from_db()
         
-        # Effectuer la prédiction
-        prediction = predictor.predict(
+        # Faire la prédiction
+        prediction = predictor.predict_match(
             request.home_team,
             request.away_team,
-            request.competition,
-            features,
-            request.odds_consensus
+            request.competition
         )
         
         # Ajouter les informations du match
@@ -485,28 +412,47 @@ async def predict_match(request: PredictionRequest):
             'competition': request.competition
         }
         
-        # Stocker la prédiction dans la base via PHP
-        store_response = requests.post(
-            PHP_BRIDGE_URL,
-            json={
-                'secret': PHP_SECRET,
-                'action': 'store_prediction',
-                'match_id': request.match_id,
-                'predicted_outcome': prediction['predicted_outcome'],
-                'home_probability': prediction['probabilities']['home'],
-                'draw_probability': prediction['probabilities']['draw'],
-                'away_probability': prediction['probabilities']['away'],
-                'confidence': prediction['confidence'],
-                'expected_goals_home': prediction['expected_goals']['home'],
-                'expected_goals_away': prediction['expected_goals']['away'],
-                'models_used': [prediction['model']]
-            }
-        )
-        
-        if store_response.status_code == 200:
-            prediction['stored'] = True
+        # Déterminer le résultat le plus probable
+        probs = prediction['probabilities']
+        if probs['home'] > probs['draw'] and probs['home'] > probs['away']:
+            prediction['predicted_outcome'] = 'HOME'
+        elif probs['draw'] > probs['away']:
+            prediction['predicted_outcome'] = 'DRAW'
         else:
-            prediction['stored'] = False
+            prediction['predicted_outcome'] = 'AWAY'
+        
+        # Sauvegarder en base si possible
+        try:
+            query = """
+            INSERT INTO predictions 
+            (match_id, home_win_prob, draw_prob, away_win_prob, confidence, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON DUPLICATE KEY UPDATE
+            home_win_prob = VALUES(home_win_prob),
+            draw_prob = VALUES(draw_prob),
+            away_win_prob = VALUES(away_win_prob),
+            confidence = VALUES(confidence),
+            updated_at = NOW()
+            """
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, (
+                request.match_id,
+                probs['home'],
+                probs['draw'],
+                probs['away'],
+                prediction['confidence']
+            ))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            prediction['saved'] = True
+            
+        except Exception as e:
+            print(f"Erreur sauvegarde: {e}")
+            prediction['saved'] = False
         
         return prediction
         
@@ -514,121 +460,94 @@ async def predict_match(request: PredictionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/predict/batch")
-async def predict_batch(background_tasks: BackgroundTasks):
+async def predict_batch():
     """
-    Prédit tous les matchs à venir (exécuté en arrière-plan)
-    """
-    background_tasks.add_task(process_upcoming_matches)
-    
-    return {
-        "status": "processing",
-        "message": "Batch prediction started in background"
-    }
-
-async def process_upcoming_matches():
-    """
-    Traite tous les matchs à venir
+    Prédire les matchs à venir
     """
     try:
-        # Récupérer les matchs à venir depuis PHP
-        response = requests.post(
-            PHP_BRIDGE_URL,
-            data={
-                'secret': PHP_SECRET,
-                'action': 'get_upcoming_matches',
-                'hours': 48
-            }
-        )
+        # Récupérer les matchs des 48 prochaines heures
+        query = """
+        SELECT 
+            match_id,
+            home_team,
+            away_team,
+            competition_name
+        FROM matches
+        WHERE match_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 48 HOUR)
+        AND home_score IS NULL
+        """
         
-        if response.status_code == 200:
-            data = response.json()
-            matches = data.get('matches', [])
-            
-            print(f"📊 Traitement de {len(matches)} matchs à venir...")
-            
-            for match in matches:
-                if not match.get('prediction_exists'):
-                    # Créer la requête de prédiction
-                    request = PredictionRequest(
-                        match_id=match['id'],
-                        home_team=match['home_team'],
-                        away_team=match['away_team'],
-                        competition=match.get('competition_name', 'Unknown')
-                    )
-                    
-                    # Effectuer la prédiction
-                    await predict_match(request)
-                    
-            print(f"✅ Batch prediction terminé")
-            
+        matches = execute_query(query)
+        
+        if not matches:
+            return {"message": "Aucun match à venir"}
+        
+        predictions = []
+        for match in matches:
+            try:
+                pred = predictor.predict_match(
+                    match['home_team'],
+                    match['away_team'],
+                    match['competition_name']
+                )
+                pred['match_id'] = match['match_id']
+                predictions.append(pred)
+            except Exception as e:
+                print(f"Erreur prédiction match {match['match_id']}: {e}")
+        
+        return {
+            "status": "success",
+            "predictions_count": len(predictions),
+            "predictions": predictions
+        }
+        
     except Exception as e:
-        print(f"❌ Erreur dans le batch prediction : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/model/info")
 def get_model_info():
     """
-    Informations détaillées sur le modèle
+    Informations sur le modèle
     """
-    # Top 10 équipes par force d'attaque
+    # Top équipes par force d'attaque
     top_attack = sorted(
-        predictor.bayesian_model.team_strengths.items(),
+        predictor.team_strengths.items(),
         key=lambda x: x[1]['attack'],
         reverse=True
     )[:10]
     
-    # Top 10 équipes par force défensive (plus bas = meilleur)
+    # Top équipes par défense (plus bas = meilleur)
     top_defense = sorted(
-        predictor.bayesian_model.team_strengths.items(),
+        predictor.team_strengths.items(),
         key=lambda x: x[1]['defense']
     )[:10]
     
     return {
-        "model_status": {
-            "trained": predictor.is_trained,
-            "training_date": predictor.training_date.isoformat() if predictor.training_date else None,
-            "total_teams": len(predictor.bayesian_model.team_strengths),
-            "total_leagues": len(predictor.bayesian_model.league_effects)
+        "model": "bayesian_lite",
+        "statistics": {
+            "total_teams": len(predictor.team_strengths),
+            "total_leagues": len(predictor.league_effects)
         },
-        "top_attack_teams": [
-            {
-                "team": team,
-                "attack_strength": round(stats['attack'], 2),
-                "matches_played": stats['matches_played']
-            }
+        "top_attack": [
+            {"team": team, "strength": round(stats['attack'], 2)}
             for team, stats in top_attack
         ],
-        "top_defense_teams": [
-            {
-                "team": team,
-                "defense_strength": round(stats['defense'], 2),
-                "matches_played": stats['matches_played']
-            }
+        "top_defense": [
+            {"team": team, "strength": round(stats['defense'], 2)}
             for team, stats in top_defense
-        ],
-        "league_effects": predictor.bayesian_model.league_effects
+        ]
     }
 
 @app.post("/model/retrain")
-async def retrain_model(background_tasks: BackgroundTasks):
+async def retrain_model():
     """
-    Réentraîne le modèle avec les dernières données
+    Réentraîner le modèle
     """
-    background_tasks.add_task(predictor.train)
-    
-    return {
-        "status": "retraining",
-        "message": "Model retraining started in background"
-    }
-
-@app.get("/health")
-def health_check():
-    """
-    Health check pour Render
-    """
-    return {"status": "healthy"}
-
-# ==================== LANCEMENT DE L'APPLICATION ====================
+    try:
+        predictor.fit_from_db()
+        return {"status": "success", "teams_trained": len(predictor.team_strengths)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Utiliser le port fourni par Render
     uvicorn.run(app, host="0.0.0.0", port=PORT)
