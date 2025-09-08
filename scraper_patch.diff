@@ -1,0 +1,65 @@
+--- a/app.py
++++ b/app.py
+@@
+ from flask import Flask, jsonify, request
+ import mysql.connector
+ from datetime import datetime
+ # Import scraper utility for FBref fixtures
+ try:
+     from scraper_fbref import scrape_all, LEAGUE_META  # type: ignore
+ except ImportError:
+     scrape_all = None
+     LEAGUE_META = {}
+
+@@
+ @app.route('/predict/<int:match_id>')
+ def predict_match(match_id):
+@@
+     return jsonify({'error': str(e)}), 500
+
+# ---------------------------------------------------------------------------
+# Scraping endpoint
+# ---------------------------------------------------------------------------
+
+@app.route('/scrape', methods=['POST'])
+def scrape_data():
+    """Trigger scraping of FBref fixtures for specified leagues and seasons.
+
+    Expected JSON payload (all fields optional):
+        {
+            "leagues": ["E0", "F1", ...],   # list of league codes to scrape
+            "start_season": "2000-2001",      # inclusive start season
+            "end_season": "2024-2025"         # inclusive end season
+        }
+
+    If `scrape_all` is unavailable (missing scraper_fbref module), this
+    endpoint will return a 500 error.
+    """
+    if scrape_all is None:
+        return jsonify({'error': 'Scraping module not available'}), 500
+
+    payload = request.get_json(silent=True) or {}
+    leagues = payload.get('leagues')
+    start_season = payload.get('start_season', '2000-2001')
+    end_season = payload.get('end_season', '2024-2025')
+    # Validate league codes
+    if leagues is not None:
+        invalid = [code for code in leagues if code not in LEAGUE_META]
+        if invalid:
+            return jsonify({'error': f'Unknown league codes: {invalid}'}), 400
+    try:
+        results = scrape_all(leagues, start_season, end_season, DB_CONFIG)
+        return jsonify({'success': True, 'inserted': results}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+--- a/requirements.txt
++++ b/requirements.txt
+@@
+ flask==2.3.3
+ flask-cors==4.0.0
+ mysql-connector-python==8.0.33
+ gunicorn==21.2.0
+ python-dotenv==1.0.0
+ requests>=2.31.0
+ beautifulsoup4>=4.12.0
